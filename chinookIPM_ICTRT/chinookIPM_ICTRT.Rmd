@@ -1,0 +1,717 @@
+---
+title: "Chinook Salmon Integrated Population Model"
+author:
+- Gregory R. Jacobs^1,2,3^
+- Russell F. Thurow^4^
+- Charles Petrosky^5^
+- Craig W. Osenberg^1,2^
+- Seth J. Wenger^1,2^
+output: pdf_document
+header-includes:
+ \usepackage{float}
+ \floatplacement{figure}{H}
+---
+1-Odum School of Ecology, University of Georgia, Athens, GA, USA
+
+2-River Basin Center, Odum School of Ecology, University of Georgia, Athens, GA, USA
+
+3-Department of Natural Resources and the Environment, Cornell University, Ithaca, NY, USA
+
+4-4US Forest Service, Rocky Mountain Research Station (Emeritus), Salmon, ID, USA
+
+5-Idaho Department of Fish and Game (retired), 600 South Walnut Street, Boise, ID
+
+```{r setup, echo = FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+set.seed(123)
+```
+
+```{r preliminaries, message=FALSE}
+library(tidyverse)
+library(ggpubr)
+library(sf)
+library(runjags)
+library(coda)
+library(ggmcmc)
+library(kableExtra)
+library(ggdist)
+library(ggsn)
+```
+
+```{r data}
+load("data.prep.12.RData")
+# Add/define supporting data for display
+streamline <- st_read(dsn="Data_supporting", layer="isth06", quiet=TRUE) 
+# streamline %>% mutate(len=st_length(.)) %>% 
+#   group_by(isth06) %>% summarize(len=sum(len)) %>% pull(len) %>% summary(.)
+wb <- st_read(dsn="Data_supporting", layer="MFSR_WBD_Dissolve", quiet=TRUE) %>% 
+  st_transform(st_crs(streamline))
+seg <- st_read(dsn="Data_supporting", layer="seg_centroid", quiet=TRUE) %>% 
+  st_transform(st_crs(streamline)) 
+seg_counts <- seg %>% cbind(data.list$y) %>% 
+  pivot_longer(cols=starts_with("X"), names_to="t", names_prefix="X", 
+               values_to="count", names_transform=list(t=as.numeric)) %>% 
+  mutate(Year=t+1987)
+#convert segment (Isaak and Thurow 2006) to ICTRT population (ICTRT 2003) scale
+pop_counts <- seg_counts %>% left_join(ilinktab) %>% 
+  group_by(pop, npop, t) %>% summarize(count=sum(count)) %>% ungroup() %>% 
+  mutate(Year=t+1987) %>% 
+  st_centroid()
+# create matrix of counts
+ypop <- st_drop_geometry(pop_counts) %>%
+  select(-Year) %>% 
+  pivot_wider(names_from=c(t), values_from=count) %>% 
+  select(!contains("pop")&!contains("Year")) %>% as.matrix()
+# convert hindcast priors
+pop.log.index <- cbind(ilinktab, 
+                       logr=data.list$logr, 
+                       sigma.logr=data.list$sigma.logr) %>% 
+  group_by(pop, npop) %>% 
+  summarize(logr=log(sum(exp(logr))), sigma.logr=mean(sigma.logr)) %>% ungroup()
+# update data.list
+data.list$y <- ypop
+data.list$s <- nrow(ypop)
+data.list$logr <- pull(pop.log.index, logr)
+data.list$sigma.logr <- pull(pop.log.index, sigma.logr)
+data.list$inds1 <- 1
+data.list$inds2 <- 2
+data.list$inds3 <- 3
+data.list$inds4 <- 4
+data.list$inds5 <- 5
+data.list$inds6 <- 6
+data.list$inds7 <- 7
+data.list$inds8 <- 8
+```
+
+```{r redd-timeseries, fig.height=3, fig.width=6, fig.cap="(Fig. S1) A stacked time-series plot of annual Middle Fork Salmon River redd counts divided into the population sub-basins of the ICTRT (2003). The sub-panel in the upper right corner of the time-series plot shows the distribution of pairwise Pearson’s correlation coefficients among segments. The map key denotes the number label of each population, and maps by color to the stacked time-series plot."}
+# define trend data for plotting
+mfsrtrend <- apply(data.list$y,2,sum, na.rm=T)[8:29]
+# Pairwise correlations
+seg.cor <- data.frame(Correlation=cor(t(data.list$y), use="pairwise.complete.obs")[lower.tri(cor(t(data.list$y), use="pairwise.complete.obs"))])
+# Plot histogram
+seg.hist<- ggplot(seg.cor, 
+  aes(x=Correlation))+
+  geom_histogram()+xlim(0,1) + theme_classic() + 
+  theme(
+  plot.title = element_blank(),
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank())
+data.seg.hist <- tibble(x = 2018, y = 2300, plot = list(seg.hist))
+seg.stack <- ggplot(pop_counts, aes(Year, count, fill=pop)) + 
+  geom_area(position = "stack", color="black") + theme_classic() + 
+  ylab("Redds") + 
+  labs(fill = "Segment") +
+  ggpp::geom_plot(data=data.seg.hist, 
+                  aes(x, y, label=plot, vp.width=.4, vp.height=.33))
+# Plot legend map
+legendmap <- ggplot() + 
+  geom_sf(data=wb, fill="white") +
+  geom_sf(data=streamline, color="blue") +
+  geom_sf(data=filter(pop_counts, t==1), aes(color=factor(npop)), size = 8) +
+  geom_sf_text(data=filter(pop_counts, t==1), aes(label = npop)) +
+  theme_void() + 
+  theme(axis.text=element_blank(), axis.title.y=element_blank(), 
+    axis.title.x = element_text(color="white"), strip.text.x=element_blank()) + 
+  theme(legend.position="none") + 
+  xlab("`")
+# build plot
+popmap <- ggarrange(seg.stack + theme(legend.position="none"), legendmap, widths=c(3,1))
+#ggsave(filename="popmap.png", plot=popmap, width=6, height=3, dpi=600, bg="white")
+#knitr::include_graphics("popmap.png")
+popmap
+```
+
+```{r runjags}
+n.chains=5
+burnin=1000000
+adapt=1000
+sample=5000
+thin=100
+  
+get.inits <- function(n.chains){
+	inits <- list()
+	for (i in 1:n.chains){
+		initsi <- list()
+		initsi$log.b = runif(1, 4, 5) #rgamma(1, 64, 14) #rnorm(1, 4.5, 0.5) 
+    initsi$sigma.b.seg = abs(rt(1, 1, 0))
+    initsi$sigma.b.yr = abs(rt(1, 1, 0))
+    initsi$sigma.b.seg.yr = abs(rt(1, 1, 0))
+		initsi$beta.del = rnorm(2, 0, 2)
+		initsi$sigma.del = abs(rt(1, 1, 0))
+		initsi$r.del= abs(rt(1, 1, 0))
+		initsi$beta.H = c(rnorm(1, 0, 2), rnorm(2, 0, 1))
+		initsi$sigma.H = abs(rt(1, 1, 0))
+		initsi$r.H= abs(rt(1, 1, 0))
+		initsi$beta.O = rnorm(6, 0, 2)
+		initsi$beta.T = rnorm(4, 0, 2)
+		initsi$beta.R = rnorm(1, 0, 2)
+		initsi$mean.p = rnorm(3, 0, 2)
+		initsi$sigma.p = abs(rt(3, 1, 0))
+		initsi$sigma.O = abs(rt(1, 1, 0))
+		initsi$sigma.T = abs(rt(1, 1, 0))
+		initsi$mu.rho3 = rnorm(1, 0, 2)
+		initsi$sigma.rho3 = abs(rt(1, 1, 0))
+		initsi$mu.rho4 = rnorm(1, 0, 2)
+		initsi$logratio = matrix(
+		  rnorm(with(data.list, s*(a.max+1)), data.list$logr, data.list$sigma.logr),
+      nrow=data.list$s, ncol=data.list$a.max+1)
+		initsi$sigma.pois = abs(rt(1, 1, 0))
+		initsi$.RNG.name = "base::Wichmann-Hill"
+		initsi$.RNG.seed = i
+		inits[[i]] <- initsi
+	}
+	return(inits)
+}
+
+# Parameters monitored
+monitor.list <- c(
+  "log.b", "sigma.b.seg", "sigma.b.yr", "sigma.b.seg.yr", "b", "b.seg",
+  "beta.del", "r.del", "del",
+  "beta.H", "r.H",
+  "beta.O", "beta.T", "beta.R", 
+  "sigma.del", "sigma.H", "sigma.O", "sigma.T",
+  "alpha.del", "alpha.H", "alpha.O", "alpha.T",
+  "phi.H", "phi.O", "phi.del", "phi.H.pred", "phi.O.pred", "phi.del.pred",
+  "pi.H", "pi.T", 
+  "sar.H", "sar.T", "phi.sar", "sar.H.pred", "sar.T.pred", "phi.sar.pred", 
+  "p", "p.T", "mean.p", "sigma.p", 
+  "mu.rho3", "sigma.rho3", "rho3",
+  "mu.rho4", "rho4", 
+  "sigma.pois", "S", "ySim", 
+  "R.S", "Smfsr", "Rmfsr", "R.Smfsr", 
+  "fit", "fit.new", "fit.T", "fit.new.T",
+  "Tobs", "Tsim"
+ )
+  
+# system.time( 
+#   results <- run.jags(model="SR_12.3.1.R", monitor=monitor.list, 
+#                       data=data.list, n.chains=n.chains, 
+#                       inits=get.inits(n.chains), burnin=burnin, sample=sample,
+#                       thin=thin, adapt=adapt, method="parallel", 
+#                       keep.jags.files=TRUE) 
+# ) 
+results <- results.jags("runjagsfiles")
+```
+
+```{r table-unconverged}
+estimated.pars <- c( #estimated parameters, not derived products
+  "log.b", "sigma.b.seg", "sigma.b.yr", "sigma.b.seg.yr",
+  "beta.del", "sigma.del", "r.del",
+  "beta.H", "r.H",
+  "beta.O", "beta.T", "beta.R", #"beta.T", "beta.R.T", 
+  "sigma.H", "sigma.O", "sigma.T", "sigma.p", 
+  "mean.p", 
+  "sigma.rho3", "mu.rho3",
+  "mu.rho4", 
+  "sigma.pois"
+ )
+res.df <- data.frame(summary(results, vars=estimated.pars, summary.iters=10000))
+tab_unconverged <- res.df %>%
+  filter(psrf>1.05) %>% 
+  dplyr::select(Median, Lower95, Upper95, SSeff, psrf, MC.ofSD) %>%
+  arrange(-psrf)
+# kable(tab_unconverged, format="simple", booktabs=TRUE, digits=3, caption="Table of stochastic parameters estimated by the model that have a Gelman's $\\hat{R}$ > 1.05. If the table is empty, all estimated parameters converged by this metric.")
+```
+
+```{r tidy-output}
+res.ggs <- ggs(as.mcmc.list(results))# %>% filter((Iteration %% 10) == 0)
+res.ggs.est <- res.ggs %>%
+  filter(grepl(paste(estimated.pars, collapse="|"), Parameter))
+```
+
+```{r sar-vs-obs, fig.height=6, fig.width=6, fig.cap="(Fig. S2) Posterior median and 90% credible interval of smolt-to-adult survival rate (SARs) across out-migration year for in-river (H group, panel a) and transported (T group, panel b) Chinook salmon smolt passage groups. Posterior estimates are conditional on random among-year variation. The red line traces annual estimates of SARs for the corresponding passage group in the Comparative Survival Study (McCann et al. 2020). Sub-panels on the right margin show annual variation in the covariates we used to explain Chinook salmon survival: Sea surface temperature (SST), April Bakun upwelling index (UWI), Average Pacific Decadal Oscillation index during May, June, and July (PDO), Columbia River hydrosystem water transit time (WTT), and the average number of powerhouse passages by smolts migrating through the Columbia River hydrosystem (PH)."}
+# In-river SARs
+sarcheckH.pred <- sars %>% dplyr::select(migrationyear, sar.c0) %>% 
+  mutate(sar.c0=sar.c0/100) %>%
+  right_join(
+    ggs_caterpillar(res.ggs, family="sar.H.pred\\[", horizontal=TRUE, sort=FALSE,
+    X=data.frame(Parameter=paste0("sar.H.pred[", 1:32, "]"), 
+      migrationyear=1988:2019))$data
+  )
+psarH.pred <- ggplot(sarcheckH.pred, aes(x=migrationyear)) + 
+  geom_ribbon(aes(ymin=Low, ymax=High), fill="gray70") + 
+  geom_line(aes(y=median)) + geom_line(aes(y=sar.c0), color="red")+ 
+  ylab("SAR") + ylim(0, 0.05) + xlab(" ") + 
+  ggtitle("In-river smolt-to-adult returns") + 
+  theme_classic()
+# Transported SARs
+sarcheckT.pred <- sars %>% dplyr::select(migrationyear, sar.t0) %>% 
+  mutate(sar.t0=sar.t0/100) %>%
+  right_join(
+    ggs_caterpillar(res.ggs, family="sar.T.pred\\[", horizontal=TRUE, sort=FALSE,
+    X=data.frame(Parameter=paste0("sar.T.pred[", 1:32, "]"), 
+      migrationyear=1988:2019))$data
+  )
+psarT.pred <- ggplot(sarcheckT.pred, aes(x=migrationyear)) + 
+  geom_ribbon(aes(ymin=Low, ymax=High), fill="gray70") + 
+  geom_line(aes(y=median)) + geom_line(aes(y=sar.t0), color="red") + 
+  ylab("SAR") + ylim(0, 0.05) + xlab("Migration year cohort") + 
+  ggtitle("Transported smolt-to-adult returns") + 
+  theme_classic()
+# SAR Covariates
+px.sst <- ggplot(data.frame(y=data.list$x.sst, x=1988:2019), aes(x=x,y=y)) + 
+  geom_line(group=1) + 
+  ylab("SST") + xlab("Year") + theme_classic() + xlim(1988, 2020)
+px.upapr <- ggplot(data.frame(y=data.list$x.upapr, x=1988:2019), aes(x=x,y=y)) + 
+  geom_line(group=1) + 
+  ylab("UWI") + xlab("Year") + theme_classic() + xlim(1988, 2020)
+px.pdomjj <- ggplot(data.frame(y=data.list$x.pdomjj, x=1988:2019), aes(x=x,y=y)) + 
+  geom_line(group=1) + 
+  ylab("PDO") + xlab("Year") + theme_classic() + xlim(1988, 2020)
+px.wtt <- ggplot(data.frame(y=data.list$x.wtt, x=1988:2019), aes(x=x,y=y)) + 
+  geom_line(group=1) + 
+  ylab("WTT") + xlab("Year") + theme_classic() + xlim(1988, 2020)
+px.ph <- ggplot(data.frame(y=data.list$x.ph, x=1988:2019), aes(x=x,y=y)) + 
+  geom_line(group=1) + 
+  ylab("PH") + xlab("Year") + theme_classic() + xlim(1988, 2020)
+sar_covs <- ggarrange(px.sst, px.upapr, px.pdomjj, px.wtt, px.ph, ncol=1)
+
+sar_ts.pred <- ggarrange(psarH.pred, psarT.pred, ncol=1, labels=c("a)","b)"))
+sar.pred_vs_obs <- ggarrange(sar_ts.pred, sar_covs, ncol=2, widths=c(5,2))
+
+#ggsave(filename="sar.pred_vs_obs.png", plot=sar.pred_vs_obs, width=6, height=6, 
+#       dpi=600, bg="white")
+#knitr::include_graphics("sar.pred_vs_obs.png")
+sar.pred_vs_obs
+```
+
+```{r redds-vs-simulated, echo=FALSE, fig.width=5, fig.height=5, fig.cap="(Fig. S4) Figure showing the correspondence between observed and simulated redd counts over time in each ICTRT population in the MFSR. Gray ribbons are the 90% highest density interval, grey lines are the average simulated redd count at each time point, and black dots are observed redds from our dataset. Panels are labeled by ICTRT population"}
+s<-data.list$s
+names.seg<-data.list$names.seg
+res.sim <-  ggs(as.mcmc.list(results), family="^ySim\\[") %>%
+  group_by(Parameter) %>%
+  summarize(mean=mean(value), lhdi=HDInterval::hdi(value, credMass=.9)[[1]], 
+            uhdi=HDInterval::hdi(value, credMass=.9)[[2]])
+res.sim$y <- as.vector(t(data.list$y))
+res.sim$Year <- rep(1988:2019,s)
+res.sim$Seg <- as.vector(sapply(1:s, function(i) rep(i, data.list$Y)))
+
+simplot <- res.sim %>% filter(Seg%in%c(1:12)) %>%
+  ggplot(aes(y=y, x=Year)) + 
+  facet_wrap(facets=vars(Seg)) + 
+  geom_ribbon(aes(ymin=lhdi, ymax=uhdi), fill="grey70", color="grey50") + 
+  geom_line(aes(y=mean), color="black", lwd=1) + 
+  geom_line(color="red") + 
+  ggtitle("Mean and HDI of the simulated number of redds") + 
+  ylab("Redds") + 
+  coord_cartesian(ylim=c(1,1200)) +
+  theme_classic()
+
+#ggsave(filename="redd_check.png", plot=simplot, width=5, height=5, dpi=600)
+#knitr::include_graphics("redd_check.png")
+simplot
+```
+
+```{r model-fit-statistics, echo = FALSE, fig.height=11, fig.width=4, fig.cap="(Fig. S5) Posterior predictive checks of Freeman-Tukey discrepancy statistics for redd counts and cohort-specific Cormack-Jolly-Seber (CJS) survival sub-models. Panels a describes the discrepancy associated with the Poisson redd counts, panel b describes the discrepancy associated with the CJS models of fish that out-migrate via the in-river pathway (H group), and panel c describes the discrepancy associated with the CJS model of fish that out-migrate via the transport pathway (T group)."}
+# Using Freeman-Tukey discrepancy
+pfitfit.new <- ggs_density(res.ggs, family='fit$|fit.new$') + 
+  ylab("Density") + xlab("Freeman-Tukey statistic")
+pfit.Tfit.T.new <- ggs_density(res.ggs, family='fit.T|fit.new.T') + 
+  ylab("Density") + xlab("Freeman-Tukey statistic")
+pTobsTsim <- ggs_density(res.ggs, family='Tobs|Tsim') + 
+  ylab("Density") + xlab("Freeman-Tukey statistic")
+
+res.disc.fit <- ggs(as.mcmc.list(results), family='fit|fit.new') %>%
+  pivot_wider(names_from=Parameter, values_from=value) 
+P.fit <- mean(with(res.disc.fit, fit>fit.new)) %>%round(., 3)
+res.disc.fit.T <- ggs(as.mcmc.list(results), family='fit.T|fit.new.T') %>%
+  pivot_wider(names_from=Parameter, values_from=value) 
+P.fit.T <- mean(with(res.disc.fit.T, fit.T>fit.new.T)) %>%round(., 3)
+res.disc.Tobs <- ggs(as.mcmc.list(results), family='Tobs|Tsim') %>%
+  pivot_wider(names_from=Parameter, values_from=value) 
+P.Tobs <- mean(with(res.disc.Tobs, Tsim>Tobs)) %>%round(., 3)
+
+ppcheckplot.Tobs <- ggplot(res.disc.Tobs, aes(y=Tsim, x=Tobs)) + 
+  geom_point() + 
+  ylim(min(res.disc.Tobs$Tsim,res.disc.Tobs$Tobs), 
+    max(res.disc.Tobs$Tsim,res.disc.Tobs$Tobs)) + 
+  xlim(min(res.disc.Tobs$Tsim,res.disc.Tobs$Tobs), 
+    max(res.disc.Tobs$Tsim,res.disc.Tobs$Tobs)) + 
+  geom_abline(slope=1)  + 
+  ylab("Discrepancy of simulated data") +
+  xlab("Discrepancy of data") +
+  ggtitle("Poisson redd count discrepancy") + 
+  theme_minimal() +
+  annotate("text", min(res.disc.Tobs$Tobs), max(res.disc.Tobs$Tsim), 
+    label=paste("P =", with(res.disc.Tobs, round(mean(Tsim>Tobs),3))), hjust=0)
+
+ppcheckplot.fit.H <- ggplot(res.disc.fit, aes(y=fit.new, x=fit)) + 
+  geom_point() + 
+  ylim(min(res.disc.fit$fit.new,res.disc.fit$fit), 
+    max(res.disc.fit$fit.new,res.disc.fit$fit)) + 
+  xlim(min(res.disc.fit$fit.new,res.disc.fit$fit), 
+    max(res.disc.fit$fit.new,res.disc.fit$fit)) + 
+  geom_abline(slope=1)  + 
+  ylab("Discrepancy of simulated data") +
+  xlab("Discrepancy of data") +
+  ggtitle("In-river CJS discrepancy") +  
+  theme_minimal() +
+  annotate("text", min(res.disc.fit$fit), max(res.disc.fit$fit.new), 
+    label=paste("P =", with(res.disc.fit, round(mean(fit.new>fit),3))), hjust=0)
+
+ppcheckplot.fit.T <- ggplot(res.disc.fit.T, aes(y=fit.new.T, x=fit.T)) + 
+  geom_point() + 
+  ylim(min(res.disc.fit.T$fit.new.T,res.disc.fit.T$fit.T), 
+    max(res.disc.fit.T$fit.new.T,res.disc.fit.T$fit.T)) + 
+  xlim(min(res.disc.fit.T$fit.new.T,res.disc.fit.T$fit.T), 
+    max(res.disc.fit.T$fit.new.T,res.disc.fit.T$fit.T)) + 
+  geom_abline(slope=1)  + 
+  ylab("Discrepancy of simulated data") +
+  xlab("Discrepancy of data") +
+  ggtitle("Transported CJS discrepancy") +  
+  theme_minimal() +
+  annotate("text", min(res.disc.fit.T$fit.T), max(res.disc.fit.T$fit.new.T), 
+    label=paste("P =", with(res.disc.fit.T, round(mean(fit.new.T>fit.T),3))), 
+    hjust=0)
+
+postpredplot <- ggarrange(ppcheckplot.Tobs, ppcheckplot.fit.H, 
+                          ppcheckplot.fit.T, labels=letters[1:3], ncol=1)
+postpredplot
+```
+
+```{r quantile-discrepancy-ppc, fig.height=4, fig.width=4, fig.cap="(Fig. S6) Visual quantile distribution check for the redd count dataset ($y$) versus simulated redd counts ($y^{sim}$) showing . We estimated the 5th through 95th percentiles of redd counts and that of simulated redd counts across segments and time (at 5% intervals) for each posterior sampling iteration in each chain. We then plotted distributions of simulated quantiles against corresponding data quantiles and compared to a 1:1 line to evaluate posterior predictive performance across the data distribution. Whiskers are the 95% credible intervals. Axes are square root-scaled (instead of log-scaled) to facilitate visualization without omitting zeros."}
+res.ppc <- filter(res.ggs, grepl("ySim\\[", Parameter)) %>% 
+   separate(Parameter, into=c("Paramname", "i", "t"), sep="\\]|\\[|\\,",
+    remove=FALSE, extra="drop", convert=TRUE) %>% 
+  left_join(st_drop_geometry(pop_counts) %>% select(i=npop, t=t, y=count))
+res.qq <- res.ppc %>% 
+  filter(!is.na(y)) %>% 
+  group_by(Iteration, Chain) %>% 
+  summarize(q_5=quantile(y, probs=0.05),
+            q_10=quantile(y, probs=0.10),
+            q_15=quantile(y, probs=0.15),
+            q_20=quantile(y, probs=0.20),
+            q_25=quantile(y, probs=0.25),
+            q_30=quantile(y, probs=0.30),
+            q_35=quantile(y, probs=0.35),
+            q_40=quantile(y, probs=0.40),
+            q_45=quantile(y, probs=0.45),
+            q_50=quantile(y, probs=0.50),
+            q_55=quantile(y, probs=0.55),
+            q_60=quantile(y, probs=0.60),
+            q_65=quantile(y, probs=0.65),
+            q_70=quantile(y, probs=0.70),
+            q_75=quantile(y, probs=0.75),
+            q_80=quantile(y, probs=0.80),
+            q_85=quantile(y, probs=0.85),
+            q_90=quantile(y, probs=0.90),
+            q_95=quantile(y, probs=0.95),
+            qSim_5=quantile(value, probs=0.05),
+            qSim_10=quantile(value, probs=0.10),
+            qSim_15=quantile(value, probs=0.15),
+            qSim_20=quantile(value, probs=0.20),
+            qSim_25=quantile(value, probs=0.25),
+            qSim_30=quantile(value, probs=0.30),
+            qSim_35=quantile(value, probs=0.35),
+            qSim_40=quantile(value, probs=0.40),
+            qSim_45=quantile(value, probs=0.45),
+            qSim_50=quantile(value, probs=0.50),
+            qSim_55=quantile(value, probs=0.55),
+            qSim_60=quantile(value, probs=0.60),
+            qSim_65=quantile(value, probs=0.65),
+            qSim_70=quantile(value, probs=0.70),
+            qSim_75=quantile(value, probs=0.75),
+            qSim_80=quantile(value, probs=0.80),
+            qSim_85=quantile(value, probs=0.85),
+            qSim_90=quantile(value, probs=0.90),
+            qSim_95=quantile(value, probs=0.95)) %>% 
+  ungroup() %>% 
+  pivot_longer(cols=q_5:qSim_95, 
+               names_to=c("par", "quantile"),
+               names_sep="_") %>% 
+  pivot_wider(names_from=par, values_from=value) %>% 
+  mutate(quantile=as.numeric(quantile), Pq=1*(q>qSim))
+res.qq.summary <- res.qq %>% group_by(quantile) %>% median_hdci(qSim) %>% 
+  mutate(q=res.qq %>% filter(Iteration==1, Chain==1) %>% pull(q))
+ggplot(res.qq.summary, aes(y=qSim, x=q)) +
+  geom_errorbar(aes(ymin=.lower, ymax=.upper)) +
+  geom_abline(slope=1) +
+  scale_y_sqrt() +
+  scale_x_sqrt() +
+  ylab(bquote(y^sim~at~each~quantile)) +
+  xlab("y at each quantile") +
+  theme_classic()
+```
+
+```{r simulate-SAR}
+##########
+# input data 
+#t0 <- Sys.time()
+set.seed(1)
+sample_iters <- sample(1:max(res.ggs$Iteration), 999)
+res.b <-   res.ggs %>% filter(Iteration%in%sample_iters) %>%
+  filter(grepl("^b\\[", Parameter)) %>% 
+  filter(!grepl("32|31", Parameter)) %>%
+  separate(Parameter, into=c("b", "i", "t"), sep="\\]|\\[|\\,",
+    remove=FALSE, extra="drop", convert=TRUE) %>%
+  dplyr::select(Iteration, Chain, i, t, b=value)
+res.phi.sar <- res.ggs %>% filter(Iteration%in%sample_iters) %>%
+  filter(grepl("phi.sar\\[", Parameter)) %>% 
+  filter(!grepl("\\[2\\]|\\[1\\]", Parameter)) %>%
+  separate(Parameter, into=c("phi.sar", "t"), sep="\\]|\\[|\\,",
+    remove=FALSE, extra="drop", convert=TRUE) %>%
+  mutate(t=t-2) %>% #convert time index to a broodyear index
+  dplyr::select(Iteration, Chain, t, phi.sar=value)
+siminput <- full_join(res.b, res.phi.sar)  %>% 
+  mutate(R=phi.sar*b) %>% 
+  rowid_to_column("index")
+#Sys.time()-t0
+res.b <- res.phi.sar <- t0 <- NULL#; gc()
+##########
+# simulation parameters - based on cross-time mean SAR, no spatial component
+estSAR_summary <- siminput %>%
+  filter(i==1) %>%
+  group_by(Iteration, Chain) %>% 
+  summarize(geomeanSAR=exp(mean(log(phi.sar)))) %>% # geomean SAR by iteration
+  ungroup() %>%
+  median_hdci(geomeanSAR, .width=0.9)
+estSAR <- pull(estSAR_summary, geomeanSAR) # median geomean SAR
+simlevels <- c(estSAR, seq(0.01, 0.02, 0.002), seq(0.03, 0.06, 0.01))
+##########
+# simulate SAR and recruits per spawner for each brood year in each segment
+## apply simulated SARs to each segment in each year in each iteration/chain
+#system.time(
+  simulations <- expand.grid(index=siminput$index, sim=simlevels) %>% 
+    as_tibble() %>%
+    left_join(siminput) %>%
+    mutate(x=if_else(is.na(sim),1, sim/estSAR)) %>% #multiplier for phi.sar
+    mutate(sim.sar=phi.sar*x) %>%
+    mutate(sim.R=sim.sar*b)
+#) 
+##########
+# Summarize simulations
+## summarize simulated SARs: median and HDCI of geometric mean SAR by simulation
+#system.time(
+  sim_SARs <- simulations %>% 
+  dplyr::select(sim, Iteration, Chain, t, sim.sar) %>%
+    distinct() %>% 
+    group_by(sim, Iteration, Chain) %>% 
+  mutate(gSAR=exp(mean(log(sim.sar)))) %>% 
+    ungroup() %>%
+    group_by(sim) %>% median_hdci(gSAR, .width=0.9) %>%
+    ungroup()
+#) 
+## segment geometric mean growth rate by simulation, Iteration, and Chain
+#system.time(
+  sim_gRsegments <- group_by(simulations, sim, Iteration, Chain, i) %>%
+    summarize(gR=exp(mean(log(sim.R)))) %>%
+    ungroup() 
+#) 
+## number of suitable segments by simulation, Iteration, and Chain
+fmode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+#system.time(
+  sim_suitabile <- sim_gRsegments %>% mutate(suit=gR>=1) %>%
+    group_by(sim, Iteration, Chain) %>%
+    summarize(nsuit=sum(suit)) %>% ungroup() %>%
+    group_by(sim) %>%
+    median_hdci(nsuit, .width=0.9) %>%
+    ungroup()
+#) 
+#system.time(
+  sim_meanmedmode <- sim_gRsegments %>% mutate(suit=gR>=1) %>%
+    group_by(sim, Iteration, Chain) %>%
+    summarize(nsuit=sum(suit)) %>% ungroup() %>%
+    group_by(sim) %>%
+    summarize(mean=mean(nsuit), median=median(nsuit), mode=fmode(nsuit)) %>%
+    ungroup() %>%
+    pivot_longer(mean:mode)
+#) 
+```
+
+```{r birthrate, echo = FALSE, fig.width=8, fig.height=3, fig.cap="(Fig. 3) Spatial distribution of reproductive rate, b (female smolts per redd) and population growth, $\\lambda$ (redds per redd). In dot-whisker plots (a,b), dots indicate the median of posterior samples, thick lines the 90% highest density interval, and thin lines 95% highest density interval. Panel (a) shows the reproductive rate (b) for each spatial unit (i.e., ICTRT population). Panel (b) shows the growth rate ($\\lambda$) for each spatial unit. Panel (c) depicts the approximate spatial distribution of median growth rate estimates across the MFSR (blue line) and its watershed (black outline), where points are labeled by segment to match median and credible interval plots. Colors range from dark to light with increasing $\\lambda$."}
+# filter input dataset
+pop <- filter(pop_counts, t==1) %>% select(pop=npop, geometry)
+# segment-specific cross-time geometric mean lambda by iteration and chain
+seg.lit <- filter(sim_gRsegments, sim==estSAR) %>% 
+    rename(name=i, value=gR) %>% select(-sim)%>%
+  mutate(Parameter=as.factor(as.numeric(name))) %>% #hack "for ggs plots
+  mutate(psize=1, pop=name) %>%
+  left_join(pop, by=c("pop")) #%>% st_as_sf()
+# median and highest density interval of cross-time geometric mean lambda
+seg.l <- seg.lit %>% 
+  group_by(name) %>% median_hdci(value, .width=0.9) %>%
+  mutate(pop=name) %>%
+  left_join(seg.lit%>%dplyr::select(pop, psize, geometry)%>%distinct())
+# segment-specific cross-time geometric mean birthrate by iteration and chain
+seg.bit <- group_by(siminput, Iteration, Chain, i) %>%
+  summarize(gb=exp(mean(log(b)))) %>%
+  ungroup() %>%
+  rename(name=i, value=gb) %>% 
+  mutate(Parameter=as.factor(as.numeric(name))) %>% #hack "for ggs plots
+  mutate(psize=1, pop=name) %>%
+  left_join(pop, by=c("pop")) #%>% st_as_sf()
+# mode and highest density interval of cross-time geometric mean birthrate
+seg.b <- seg.bit %>% 
+  group_by(name) %>% median_hdci(value, .width=0.9) %>%
+  mutate(pop=name) %>%
+  left_join(seg.bit%>%dplyr::select(pop, psize, geometry)%>%distinct())
+### Plots ###
+# caterpillar plot of segment geomean lambdas
+pl<- ggs_caterpillar(seg.lit, horizontal=TRUE, sort=TRUE) +
+  xlab(expression('Growth rate'~(lambda["(i)"]))) + ylab("Population") + 
+  theme_classic() + theme(axis.text.y=element_blank()) + 
+  geom_vline(xintercept=1, lty=2)
+pl$data <- left_join(pl$data, seg.l%>%dplyr::select(name,pop))
+pl <- pl + geom_text(aes(x=high, label=pop), nudge_x=.05) 
+# caterpillar plot of segment geomean birth rates
+pb <- ggs_caterpillar(seg.bit, horizontal=TRUE, sort=TRUE) +
+  xlab(expression('Reproductive rate'~(italic(b[population])))) + 
+  ylab("Population") + theme_classic() + theme(axis.text.y=element_blank()) 
+pb$data <- left_join(pb$data, seg.b%>%dplyr::select(name,pop))
+pb <- pb + geom_text(aes(x=high, label=pop), nudge_x=17)
+# map panels
+lambdabreak_seg.l <- abs(diff(c(range(seg.l$value)[1],1)))/
+  diff(c(range(seg.l$value)))
+pmap_l <- ggplot() +
+  geom_sf(data=wb, fill="white") +
+  geom_sf(data=streamline, color="blue") +
+  geom_sf(data=st_as_sf(seg.l), aes(color=value), size=10) +  
+  geom_sf_text(data=st_as_sf(seg.l), aes(label=pop),
+               color=ifelse(seg.l$value>.8, "black", "grey")) +
+  scale_color_viridis_c(begin=0.1) +
+  theme_void() +
+  theme(axis.text=element_blank(), axis.title.y=element_blank(), 
+        axis.title.x=element_text(color="white"), 
+        strip.text.x=element_blank()) + 
+  xlab("`") + 
+  labs(color=expression(lambda)) 
+#combine panels to one figure
+birthrate <- ggarrange(pb, pl, pmap_l, labels=letters[1:3], ncol=3, nrow=1)
+#ggsave(filename="birthrate_pop.png", plot=birthrate, width=8, height=3, 
+#       dpi=600, bg="white")
+#knitr::include_graphics("birthrate_pop.png")
+birthrate
+```
+
+```{r geomean-phi.sar, include=FALSE}
+filter(res.ggs, grepl("phi.sar", Parameter)) %>% 
+  group_by(Iteration, Chain) %>%
+  summarize(gmean.phi.sar.PCT=100*exp(mean(log(value)))) %>% 
+  ungroup() %>%
+  median_hdi(gmean.phi.sar.PCT, .width=0.9)
+```
+
+```{r sim-figure-objects}
+# note: only plotting through 2% SAR
+nsuit <- sim_suitabile %>% filter(sim<=.02)
+# a spatial point data frame of the expected suitable segments by simulation
+sf.gt1 <- lapply(1:nrow(nsuit), function(x){
+  seg.b %>% mutate(sim=nsuit$sim[x]) %>% slice_max(value, n=nsuit$nsuit[x])
+}) %>% bind_rows() %>%
+  mutate(simf=as.factor(as.numeric(as.factor(sim)))) %>%
+  st_as_sf()
+# per-simulation data for histograms
+sim.k.lgt1 <- filter(sim_gRsegments, sim<=.02) %>% 
+  mutate(ksim=paste(round(sim*100,2), "%"), suit=1*(gR>=1)) %>% 
+  group_by(sim, Iteration, Chain) %>% 
+  summarize(lgt1=sum(suit))
+sim.pts <- sim_meanmedmode %>% filter(sim<=.02) %>%
+  mutate(ksim=paste0("SAR=", round(sim*100,2), "%")) %>%
+  filter(name=="median")
+```
+
+```{r sim-figure, fig.width=8, fig.height=2.25, fig.cap="(Fig. 4). Predicted number and location of ICTRT populations in the MFSR with positive Chinook salmon population growth rates under Snake River smolt-to-adult return (SAR) survival scenarios. Horizontal bar plots indicate posterior distributions of the number of ICTRT populations in the MFSR (8 total) with growth rates above replacement ($\\lambda$>1) and black dots indicate the median. Map panels next to bar plots indicate the locations of the segments most likely to have growth rates above replacement under each SAR scenario, with colors ranging from dark to light with increasing $\\lambda$. "}
+simSARlab <- c("SAR=0.74%", sim.pts$ksim[2:length(sim.pts$ksim)])
+#then some colors to assign
+birthratecolors <- data.frame(pop=seg.l$pop, 
+                              col=colourvalues::colour_values(seg.l$value)) 
+plambdamap_colorramp <- rep("white", 7) # gray
+plambdamap_list <- lapply(1:7, function(i){
+  sf.gt1 %>% filter(simf==i) %>% left_join(birthratecolors) %>% ggplot() +
+  geom_sf(data=wb, fill="white") +
+  geom_sf(data=streamline, color="light blue") +
+  geom_sf(shape=19, size=3, aes(color=col)) +
+  theme_void() + scale_color_identity() +
+  ggtitle(paste(simSARlab[i]))  +
+  theme(axis.text=element_blank(), 
+        axis.title.y=element_blank(), 
+        axis.title.x = element_text(color="white"), 
+        strip.text.x = element_blank(),
+        legend.position="none",
+        plot.title=element_text(size=8, hjust=0.5)) +  
+  xlab(" ")
+})
+simhist_list <- lapply(1:7, function(i){
+  sim.k.lgt1 %>% ungroup() %>%
+  mutate(simf=dense_rank(sim)) %>% 
+  filter(simf==i) %>%
+  ggplot(aes(y=lgt1,  x =..density..)) + 
+  geom_histogram(binwidth=1, color="grey20", fill=plambdamap_colorramp[i]) + 
+  geom_point(data=sim.pts[i,], aes(y=value, x=0.05, shape=name), size=2) +
+  ylab(expression(paste("Number ", ~lambda[(i)], " > 1"))) + 
+  xlab("Probability") + theme_classic() +
+  theme(legend.position="none") +  ylim(-0.5,8.5) +
+  scale_x_continuous(breaks=c(0,0.5), limits=c(0,1)) 
+})
+# LIst of combined plots
+cpcombolist <- lapply(1:7, function (i){
+cowplot::ggdraw()+ 
+  cowplot::draw_plot(simhist_list[[i]]+
+                       rremove("ylab") + rremove("xlab")) +
+  cowplot::draw_plot(plambdamap_list[[i]], 
+                     x = .4, y = 0.05, width=0.6, height = .7) 
+})
+pgt1_pop <- ggarrange(plotlist=cpcombolist[1:6], nrow=1, ncol=6, 
+                      labels=paste0(letters[1:6], ")"))
+pgt1_pop2 <- annotate_figure(pgt1_pop, 
+  left=textGrob(expression(paste("Number ", ~lambda[(i)], " > 1")), 
+                rot = 90, vjust=1, gp=gpar(cex=1)),
+  bottom=textGrob("Probability", gp=gpar(cex=1)))
+#ggsave(filename="pgt1_pop.png", plot=pgt1_pop2, width=8, height=2.25, dpi=600, 
+#       bg="white")
+#knitr::include_graphics("pgt1_pop.png")
+pgt1_pop2
+```
+
+```{r response-surface, fig.cap="(Fig. 5) Response surface of population growth rate ($\\lambda$) versus smolt production rate (b) and smolt-to-adult return rate ($\\phi_SAR$). Color indicates population growth rate from red (low) to white (replacement) to blue (high), and the black dotted contour line indicates an isocline of no net population growth ($\\lambda$=1). The SAR from 2% to 6% represents lower and upper management targets for salmon restoration. Median ICTRT population-specific smolt production rates are plotted as black points at the geometric mean $\\phi_SAR$ of 0.74% from 1994-2018. The arrow represents our simulated increase of SAR from 0.74% up to 2.0%, with gray unfilled circles indicating projected $\\lambda$ for each segment at $\\phi_SAR$ = 2.0%. "}
+median_sar <- sim_SARs[1,]
+sardat <- data.frame(
+  segment=pb$data$pop,
+  parameter=pb$data$Parameter,
+  b=pb$data$median, 
+  sar=rep(median_sar$gSAR, length(pb$data$median)),
+  lambda=rep(1, length(pb$data$median)))
+surfaceplot.df <- expand.grid(b=0:200, sar=seq(0, 0.06, length.out=250)) %>% 
+  mutate(lambda=b*sar)
+sardat2 <- sardat %>% mutate(sar=.02)
+arrowdf <- data.frame(b=c(100, 100), sar=c(.01, .019))
+#plot surface
+surfacebreak_seg.l <- abs(diff(c(range(surfaceplot.df$lambda)[1],1)))/
+  diff(c(range(surfaceplot.df$lambda)))
+surfaceplot_alt <- ggplot(surfaceplot.df, aes(x=sar, y=b)) + 
+  geom_raster(aes(fill=lambda)) + 
+  geom_contour(aes(z=lambda), breaks=1, color="black", lwd=.5, lty=3) + 
+  theme_minimal() +
+  scale_fill_gradientn(
+    colors = c("#b2182b", "white", "#2166ac"),
+    values = c(0, surfacebreak_seg.l, 1)
+  ) +
+  labs(fill=expression(lambda)) + 
+  ylab(expression('Smolt production rate'~(italic(b)))) +
+  geom_point(data=sardat, aes(x=sar, y=b), color="black") + 
+  geom_point(data=sardat2, aes(x=sar, y=b), shape=1, color="gray30") + 
+  geom_segment(aes(x=.01, y=100, xend=.019, yend=100), 
+               arrow=arrow(length=unit(.25, "cm")))+
+  xlab(expression('Smolt-to-adult return survival'~(phi[SAR]))) 
+#ggsave(filename="surfaceplot_alt.png", plot=surfaceplot_alt, width=6, height=4, 
+#       dpi=600, bg="white")
+#knitr::include_graphics("surfaceplot_alt.png")
+surfaceplot_alt
+```
+
+\newpage
+
+```{r testjags}
+testjags()
+```
+
+```{r sessionInfo}
+sessionInfo()
+```
