@@ -158,7 +158,7 @@ monitor.list <- c(
   "beta.O", "beta.T", "beta.R", 
   "sigma.del", "sigma.H", "sigma.O", "sigma.T",
   "alpha.del", "alpha.H", "alpha.O", "alpha.T",
-  "phi.H", "phi.O", "phi.del", "phi.H.pred", "phi.O.pred", "phi.del.pred",
+  "phi.H", "phi.O", "phi.T", "phi.H.pred", "phi.O.pred", "phi.T.pred",
   "pi.H", "pi.T", 
   "sar.H", "sar.T", "phi.sar", "sar.H.pred", "sar.T.pred", "phi.sar.pred", 
   "p", "p.T", "mean.p", "sigma.p", 
