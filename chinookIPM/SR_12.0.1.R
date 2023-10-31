@@ -130,12 +130,12 @@ model {
       tau.T <- pow(sigma.T, -2)
       for (c in 1:Y){
         alpha.T[c] ~ dnorm(0, tau.T)
-        logit(phi.del[c]) <- beta.T[1] + 
+        logit(phi.T[c]) <- beta.T[1] + 
           beta.T[2]*x.sst[c] + 
           beta.T[3]*x.upapr[c] + 
           beta.T[4]*x.pdomjj[c] +
           alpha.T[c] 
-        logit(phi.del.pred[c]) <- beta.T[1] + 
+        logit(phi.T.pred[c]) <- beta.T[1] + 
           beta.T[2]*x.sst[c] + 
           beta.T[3]*x.upapr[c] + 
           beta.T[4]*x.pdomjj[c]
@@ -193,13 +193,13 @@ model {
   			pi.H[1,c] <- phi.H[c]
   			pi.H[2,c] <- phi.O[c]*Smarine[c]
   			pi.H[3,c] <- phi.R
-  			pi.T[1,c] <- phi.B*phi.del[c]*Smarine[c]
+  			pi.T[1,c] <- phi.B*phi.T[c]*Smarine[c]
   			pi.T[2,c] <- phi.R
   			# Unconditional estimates wrt random year effects 
   			pi.H.pred[1,c] <- phi.H.pred[c]
   			pi.H.pred[2,c] <- phi.O.pred[c]*Smarine[c]
   			pi.H.pred[3,c] <- phi.R
-  			pi.T.pred[1,c] <- phi.B*phi.del.pred[c]*Smarine[c]
+  			pi.T.pred[1,c] <- phi.B*phi.T.pred[c]*Smarine[c]
   			pi.T.pred[2,c] <- phi.R
   		}
   		
@@ -332,23 +332,23 @@ model {
     
       N0[i,4] <- S[i,3] * b[i,3]
       N1[i,4] <- N0[i,3]
-      N2[i,4] <- N1[i,3] * ((phi.H[3]*phi.O[3]*(1-del[3]))+(phi.B*phi.del[3]*del[3]))
+      N2[i,4] <- N1[i,3] * ((phi.H[3]*phi.O[3]*(1-del[3]))+(phi.B*phi.T[3]*del[3]))
     
       N0[i,5] <- S[i,4] * b[i,4]
       N1[i,5] <- N0[i,4]
-      N2[i,5] <- N1[i,4] * ((phi.H[4]*phi.O[4]*(1-del[4]))+(phi.B*phi.del[4]*del[4]))
+      N2[i,5] <- N1[i,4] * ((phi.H[4]*phi.O[4]*(1-del[4]))+(phi.B*phi.T[4]*del[4]))
       N3[i,5] <- N2[i,4] * phi.A
     
       N0[i,6] <- S[i,5] * b[i,5]
       N1[i,6] <- N0[i,5]
-      N2[i,6] <- N1[i,5] * ((phi.H[5]*phi.O[5]*(1-del[5]))+(phi.B*phi.del[5]*del[5]))
+      N2[i,6] <- N1[i,5] * ((phi.H[5]*phi.O[5]*(1-del[5]))+(phi.B*phi.T[5]*del[5]))
       N3[i,6] <- N2[i,5] * phi.A
       N4[i,6] <- N3[i,5] * phi.A * (1-rho3[5])
       R4[i,6] <- N3[i,5] * phi.A * rho3[5] * phi.R
       
       N0[i,7] <- S[i,6] * b[i,6]
       N1[i,7] <- N0[i,6]
-      N2[i,7] <- N1[i,6] * ((phi.H[6]*phi.O[6]*(1-del[6]))+(phi.B*phi.del[6]*del[6]))
+      N2[i,7] <- N1[i,6] * ((phi.H[6]*phi.O[6]*(1-del[6]))+(phi.B*phi.T[6]*del[6]))
       N3[i,7] <- N2[i,6] * phi.A
       N4[i,7] <- N3[i,6] * phi.A * (1-rho3[6])
       N5[i,7] <- N4[i,6] * phi.A * (1-rho4)
@@ -362,7 +362,7 @@ model {
       # results of state transition probabilities
       N0[i,t+1] <- S[i,t] * b[i,t]
       N1[i,t+1] <- N0[i,t] #b predicts N1, this is just passage of time
-      N2[i,t+1] <- N1[i,t] * ((phi.H[t]*phi.O[t]*(1-del[t]))+(phi.B*phi.del[t]*del[t]))
+      N2[i,t+1] <- N1[i,t] * ((phi.H[t]*phi.O[t]*(1-del[t]))+(phi.B*phi.T[t]*del[t]))
       N3[i,t+1] <- N2[i,t] * phi.A
       N4[i,t+1] <- N3[i,t] * phi.A * (1-rho3[t])
       N5[i,t+1] <- N4[i,t] * phi.A * (1-rho4)
