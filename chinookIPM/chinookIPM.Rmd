@@ -110,11 +110,11 @@ sample=5000
 thin=100
 
 # debug - comment out this block to run full length chains
-n.chains=5
-burnin=1000
-adapt=1000
-sample=1000
-thin=1
+# n.chains=5
+# burnin=1000
+# adapt=1000
+# sample=1000
+# thin=1
 
 get.inits <- function(n.chains){
 	inits <- list()
@@ -169,14 +169,14 @@ monitor.list <- c(
   "fit", "fit.new", "fit.T", "fit.new.T",
   "Tobs", "Tsim"
  )
-# system.time( 
-#   results <- run.jags(model="SR_12.0.1.R", monitor=monitor.list, 
-#                       data=data.list, n.chains=n.chains, 
-#                       inits=get.inits(n.chains), burnin=burnin, sample=sample,
-#                       thin=thin, adapt=adapt, method="parallel", 
-#                       keep.jags.files=TRUE) 
-# ) 
-results <- results.jags("runjagsfiles")
+system.time( 
+  results <- run.jags(model="SR_12.0.1.R", monitor=monitor.list, 
+                      data=data.list, n.chains=n.chains, 
+                      inits=get.inits(n.chains), burnin=burnin, sample=sample,
+                      thin=thin, adapt=adapt, method="parallel", 
+                      keep.jags.files=TRUE) 
+) 
+# results <- results.jags("runjagsfiles")
 ```
 
 ```{r table-unconverged}
