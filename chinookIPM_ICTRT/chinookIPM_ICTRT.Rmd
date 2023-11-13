@@ -132,12 +132,12 @@ adapt=1000
 sample=5000
 thin=100
 
-# debug - comment out this block to run full length chains
-# n.chains=5
-# burnin=1000
-# adapt=1000
-# sample=1000
-# thin=1
+# comment out this block to run full length chains
+n.chains=5
+burnin=1000
+adapt=1000
+sample=1000
+thin=1
   
 get.inits <- function(n.chains){
 	inits <- list()
